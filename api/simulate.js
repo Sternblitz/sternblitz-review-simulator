@@ -14,55 +14,95 @@ export default async function handler(req, res) {
       .json({ error: "Missing placeId or Outscraper API key", placeId, hasKey: !!apiKey });
   }
 
-  const url = `https://api.outscraper.cloud/maps/reviews-v3?query=${encodeURIComponent(
+  const baseUrl = `https://api.outscraper.cloud/maps/reviews-v3?query=${encodeURIComponent(
     "place_id:" + placeId
   )}&reviewsLimit=0`;
 
-  let resp;
+  const headers = {
+    "X-API-KEY": apiKey,
+    Accept: "application/json",
+  };
+
+  let initialResp;
   let text;
   try {
-    resp = await fetch(url, {
-      method: "GET",
-      headers: {
-        "X-API-KEY": apiKey,
-        Accept: "application/json",
-      },
-    });
+    initialResp = await fetch(baseUrl, { method: "GET", headers });
   } catch (err) {
     console.error("Network error contacting Outscraper:", err);
-    return res
-      .status(500)
-      .json({ error: "Network error contacting Outscraper", details: err.message });
+    return res.status(500).json({ error: "Network error contacting Outscraper", details: err.message });
   }
 
   try {
-    text = await resp.text();
+    text = await initialResp.text();
   } catch (e) {
-    console.error("Failed to read response text:", e);
-    return res.status(502).json({ error: "Failed to read Outscraper response", details: e.message });
+    console.error("Failed to read initial response text:", e);
+    return res.status(502).json({ error: "Failed to read Outscraper initial response", details: e.message });
   }
 
-  let data;
+  let json;
   try {
-    data = JSON.parse(text);
+    json = JSON.parse(text);
   } catch (e) {
-    console.error("Invalid JSON from Outscraper:", text);
-    return res.status(502).json({ error: "Invalid JSON from Outscraper", raw: text });
+    console.error("Invalid JSON from Outscraper initial:", text);
+    return res.status(502).json({ error: "Invalid JSON from Outscraper initial", raw: text });
   }
 
-  if (!resp.ok || data.error) {
-    console.error("Outscraper returned error", resp.status, data);
+  // Wenn Pending, pollen
+  if (json.status === "Pending" && json.results_location) {
+    let attempts = 0;
+    const maxAttempts = 10;
+    const delay = 500; // ms
+
+    while (attempts < maxAttempts) {
+      await new Promise((r) => setTimeout(r, delay));
+      let pollResp;
+      let pollText;
+      try {
+        pollResp = await fetch(json.results_location, { method: "GET", headers });
+        pollText = await pollResp.text();
+      } catch (err) {
+        console.error("Error polling Outscraper:", err);
+        return res.status(502).json({ error: "Error polling Outscraper", details: err.message });
+      }
+
+      let pollJson;
+      try {
+        pollJson = JSON.parse(pollText);
+      } catch (e) {
+        console.error("Invalid JSON during polling:", pollText);
+        return res.status(502).json({ error: "Invalid JSON during polling", raw: pollText });
+      }
+
+      if (pollJson.status && pollJson.status !== "Pending") {
+        json = pollJson; // aktualisieren auf fertige Antwort
+        break;
+      }
+
+      attempts++;
+    }
+
+    if (json.status === "Pending") {
+      // noch nicht fertig nach retries
+      return res.status(202).json({
+        error: "Outscraper job still pending",
+        note: "Bitte in ein paar hundert Millisekunden nochmal anfragen oder retry-Logik einbauen.",
+      });
+    }
+  }
+
+  if (json.status !== "Success") {
+    console.error("Outscraper final returned non-success", json);
     return res.status(502).json({
-      error: "Outscraper returned non-ok",
-      status: resp.status,
-      body: data,
+      error: "Outscraper returned non-success status",
+      status: json.status,
+      body: json,
     });
   }
 
-  const placeData = Array.isArray(data.data) ? data.data[0] : null;
+  const placeData = Array.isArray(json.data) ? json.data[0] : null;
   if (!placeData) {
-    console.error("Missing place data in Outscraper response", data);
-    return res.status(500).json({ error: "Missing place data", raw: data });
+    console.error("Missing place data after polling", json);
+    return res.status(500).json({ error: "Missing place data", raw: json });
   }
 
   const rawBreakdown = placeData.reviews_per_score || {};
@@ -95,5 +135,6 @@ export default async function handler(req, res) {
     totalReviews,
     averageRating: parseFloat(averageRating.toFixed(2)),
     breakdown,
+    source: { usedOutscraper: true },
   });
 }
