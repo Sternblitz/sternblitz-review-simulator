@@ -2,10 +2,9 @@
 // Erwartet: Environment Variable OUTSCRAPER_API_KEY mit deinem Outscraper-Key
 
 export default async function handler(req, res) {
-  // CORS erlauben (für Webflow etc.)
+  // CORS (für Webflow etc.)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  // für Preflight
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
@@ -17,11 +16,11 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Missing placeId or Outscraper API key" });
   }
 
-  // Google Maps Place URL, wie Outscraper sie erwartet
   const placeUrl = `https://www.google.com/maps/place/?q=place_id:${encodeURIComponent(placeId)}`;
 
   try {
-    const resp = await fetch("https://api.outscraper.com/maps/reviews", {
+    // 1. Versuch: POST
+    let resp = await fetch("https://api.outscraper.com/maps/reviews", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -29,9 +28,21 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         queries: [placeUrl],
-        // optional: language: "de"  // wenn du deutsche Ausgabe willst
       }),
     });
+
+    // Fallback bei 405 auf GET
+    if (resp.status === 405) {
+      resp = await fetch(
+        `https://api.outscraper.com/maps/reviews?query=${encodeURIComponent(placeUrl)}`,
+        {
+          method: "GET",
+          headers: {
+            "X-API-KEY": outscraperKey,
+          },
+        }
+      );
+    }
 
     if (!resp.ok) {
       const text = await resp.text();
@@ -41,7 +52,7 @@ export default async function handler(req, res) {
     const data = await resp.json();
     const place = Array.isArray(data) ? data[0] : data;
 
-    // normalization: breakdown aus reviews_per_score
+    // Breakdown aus reviews_per_score
     const raw = place.reviews_per_score || {};
     const breakdown = {
       1: parseInt(raw["1"] || 0, 10),
@@ -51,13 +62,13 @@ export default async function handler(req, res) {
       5: parseInt(raw["5"] || 0, 10),
     };
 
-    // totalReviews: entweder direkt oder Summe aus breakdown
+    // totalReviews
     const totalReviews =
       typeof place.reviews === "number" && place.reviews > 0
         ? place.reviews
         : Object.values(breakdown).reduce((sum, v) => sum + v, 0);
 
-    // averageRating: nehmen, falls vorhanden, sonst selbst berechnen
+    // averageRating (Fallback selbst berechnen)
     let averageRating = parseFloat(place.rating || 0);
     if ((!averageRating || averageRating === 0) && totalReviews > 0) {
       const weightedSum =
