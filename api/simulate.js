@@ -3,24 +3,38 @@
 export default async function handler(req, res) {
   const id = req.query.placeId || req.query.place_id || req.query.data_id;
   const serpApiKey = process.env.SERPAPI_KEY;
-  const explicitFull = String(req.query.full || "").toLowerCase() === "true"; // ?full=true
 
   if (!id || !serpApiKey) {
     return res.status(400).json({ error: "Missing placeId/data_id or API key" });
   }
 
-  // Hilfsfunktion: eine Seite laden
+  // Helper: fetch with timeout to avoid hängende Requests
+  async function fetchWithTimeout(url, timeoutMs = 5000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+      return resp;
+    } catch (e) {
+      clearTimeout(timeout);
+      throw e;
+    }
+  }
+
+  // Eine Seite laden (Reviews engine)
   async function fetchReviewsPage(nextPageToken = null) {
     const params = new URLSearchParams({
       engine: "google_maps_reviews",
       api_key: serpApiKey,
-      hl: "de"
+      hl: "de",
     });
     if (req.query.data_id) params.set("data_id", id);
     else params.set("place_id", id);
     if (nextPageToken) params.set("next_page_token", nextPageToken);
+
     const url = `https://serpapi.com/search.json?${params.toString()}`;
-    const resp = await fetch(url);
+    const resp = await fetchWithTimeout(url);
     if (!resp.ok) {
       const txt = await resp.text();
       throw new Error(`SerpApi non-OK: ${txt}`);
@@ -60,46 +74,44 @@ export default async function handler(req, res) {
 
     accumulate(firstPage.reviews || []);
 
-    // Entscheiden, ob wir voll nachladen: explizit oder weil sample < reported total
-    let wantFull = explicitFull;
-    if (!wantFull && totalReviewsFromPlace && (firstPage.reviews || []).length < totalReviewsFromPlace) {
-      wantFull = true; // automatisch komplett nachladen
-    }
-
-    let full = false;
+    // Vollständige Pagination immer versuchen (wenn wir wissen, wie viele insgesamt sein sollen)
+    let fullFetched = false;
     let truncated = false;
 
-    if (wantFull) {
-      full = true;
-      const maxToFetch = totalReviewsFromPlace || 5000; // wirklich bis zur gemeldeten Gesamtzahl oder vernünftiges Backup
+    if (totalReviewsFromPlace && countedReviews < totalReviewsFromPlace) {
+      fullFetched = true;
+      const expectedPages = Math.ceil(totalReviewsFromPlace / 8);
+      const capPages = Math.min(expectedPages, 300); // Sicherheitslimit: max. 300 Seiten
+      let pagesFetched = 1;
       let nextToken =
         firstPage.serpapi_pagination?.next_page_token ||
         firstPage.next_page_token ||
         null;
 
-      while (nextToken && countedReviews < maxToFetch) {
-        const page = await fetchReviewsPage(nextToken);
-        accumulate(page.reviews || []);
-        nextToken =
-          page.serpapi_pagination?.next_page_token || page.next_page_token || null;
+      while (nextToken && pagesFetched < capPages) {
+        try {
+          const page = await fetchReviewsPage(nextToken);
+          accumulate(page.reviews || []);
+          nextToken =
+            page.serpapi_pagination?.next_page_token ||
+            page.next_page_token ||
+            null;
+          pagesFetched++;
+        } catch (e) {
+          console.warn("Pagination fetch error:", e.message);
+          break; // bei Fehler abbrechen, aber Daten verwenden
+        }
       }
 
-      // Wenn wir gemeldete Gesamtzahl haben und wir weniger gesammelt haben, aber kein nextToken mehr da ist:
-      if (totalReviewsFromPlace && countedReviews < totalReviewsFromPlace && !nextToken) {
-        // entweder SerpApi liefert weniger trotz gemeldetem total, oder wir haben schon alles
-        // truncated bleibt false, weil kein Abbruch wegen Limit
-      }
-
-      // Wenn wir aufgrund maxToFetch abgebrochen haben (nur relevant wenn place_info fehlt)
-      if (!totalReviewsFromPlace && countedReviews >= 5000) {
-        truncated = true;
+      if (countedReviews < totalReviewsFromPlace && pagesFetched >= capPages) {
+        truncated = true; // nicht komplett geladen wegen Cap
       }
     }
 
-    // Durchschnitt aus dem Sample (fallback)
+    // Durchschnitt aus dem (vollständigen oder sample) Reviews
     const averageFromSample = countedReviews > 0 ? sum / countedReviews : 0;
 
-    // Finalpräferenzen: place_info > berechnetes
+    // Finale Werte: bevorzugt place_info
     const totalReviews = totalReviewsFromPlace || countedReviews;
     const averageRating =
       averageRatingFromPlace !== null
@@ -115,7 +127,7 @@ export default async function handler(req, res) {
       totalReviews,
       averageRating: parseFloat(averageRating.toFixed(2)),
       breakdown,
-      breakdown_full: full,
+      breakdown_full: fullFetched,
       truncated,
       source: {
         usedPlaceInfo: !!placeInfo.title,
