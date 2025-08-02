@@ -1,8 +1,5 @@
 {
-  "name": "sternblitz-review-simulator",
+  "name": "review-simulator",
   "version": "1.0.0",
-  "type": "module",
-  "dependencies": {
-    "outscraper": "*"
-  }
+  "type": "module"
 }
