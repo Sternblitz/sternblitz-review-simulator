@@ -17,7 +17,12 @@ export default async function handler(req, res) {
   }
 
   // Baue die Query: wenn Name vorhanden, nutze "Name, Address", sonst fallback auf placeId
-  const queryStr = name ? `${name}${address ? `, ${address}` : ""}` : placeId;
+ let queryStr;
+if (placeId) {
+  queryStr = `place_id:${placeId}`;
+} else {
+  queryStr = name + (address ? `, ${address}` : "");
+}
 
   const url = new URL("https://api.app.outscraper.com/maps/search-v3");
   url.searchParams.set("query", queryStr);
