@@ -1,4 +1,3 @@
-// Datei: api/simulate.js
 export default async function handler(req, res) {
   const placeId = req.query.placeId || req.query.place_id;
   const apiKey = process.env.OUTSCRAPER_API_KEY;
@@ -7,102 +6,80 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Missing placeId or Outscraper API key" });
   }
 
-  // Baue die Query-URL (placeId als query; Outscraper akzeptiert z.B. place_id direkt als query)
-  const baseUrl = "https://api.outscraper.cloud/maps/reviews-v3";
-  const url = new URL(baseUrl);
-  url.searchParams.set("query", placeId);
-  // optional: beschränken, wenn du nur die Zahlen brauchst, kannst du z.B. reviewsLimit=0 (je nach API-Doku)
-  url.searchParams.set("reviewsLimit", "0"); // 0 = unlimited / nur summary (falls unterstützt)
-
   const headers = {
     "X-API-Key": apiKey,
     "Accept": "application/json",
   };
 
   try {
-    // Erste Anfrage: job anstoßen
-    const first = await fetch(url.toString(), { method: "GET", headers });
-    if (!first.ok) {
-      const txt = await first.text();
-      return res.status(502).json({ error: "Outscraper initial request failed", details: txt });
+    // Variante A: search-v3 direkt mit Place ID (schnellste Summary)
+    const searchUrl = new URL("https://api.outscraper.com/maps/search-v3");
+    searchUrl.searchParams.set("query", `place_id:${placeId}`);
+    searchUrl.searchParams.set("organizationsPerQueryLimit", "1");
+    searchUrl.searchParams.set("async", "false"); // direkt synchron
+    // optional: language, region etc.
+
+    const searchResp = await fetch(searchUrl.toString(), { method: "GET", headers });
+    if (!searchResp.ok) {
+      const text = await searchResp.text();
+      return res.status(502).json({ error: "Outscraper search-v3 failed", details: text });
     }
-    const firstJson = await first.json();
+    const searchJson = await searchResp.json();
 
-    // Wenn der Job noch pending ist: pollen
-    let result;
-    if (firstJson.status && firstJson.status !== "Success") {
-      // erwartet: firstJson.results_location mit URL zum Abfragen
-      const pollUrl = firstJson.results_location || firstJson.raw?.results_location;
-      if (!pollUrl) {
-        return res.status(500).json({ error: "Missing results_location from Outscraper response", raw: firstJson });
-      }
+    // Drill down in die Antwortstruktur
+    const entry = Array.isArray(searchJson.data?.[0]) ? searchJson.data[0][0] : searchJson.data?.[0];
+    if (!entry) {
+      return res.status(404).json({ error: "Place not found in search-v3 response", raw: searchJson });
+    }
 
-      // Polling mit Backoff (max ~5s)
-      const maxAttempts = 10;
-      let attempt = 0;
-      while (attempt < maxAttempts) {
-        await new Promise((r) => setTimeout(r, 300 * (attempt + 1))); // 300ms, 600ms, ...
-        const polled = await fetch(pollUrl, { method: "GET", headers });
-        if (!polled.ok) {
-          const t = await polled.text();
-          return res.status(502).json({ error: "Outscraper poll failed", details: t });
-        }
-        const polledJson = await polled.json();
-        if (polledJson.status === "Success") {
-          result = polledJson;
-          break;
-        }
-        attempt++;
+    const breakdown = entry.reviews_per_score || {};
+
+    // Fallback: Wenn reviews_per_score fehlt, hole von reviews-v3 nur summary
+    let totalReviews = Object.values(breakdown).reduce((sum, v) => sum + Number(v || 0), 0);
+    let averageRating = entry.rating ?? 0;
+
+    if (!entry.reviews_per_score) {
+      const reviewsUrl = new URL("https://api.outscraper.com/maps/reviews-v3");
+      reviewsUrl.searchParams.set("query", placeId);
+      reviewsUrl.searchParams.set("reviewsLimit", "0"); // keine einzelnen Reviews
+      const reviewsResp = await fetch(reviewsUrl.toString(), { method: "GET", headers });
+      if (!reviewsResp.ok) {
+        const t = await reviewsResp.text();
+        return res.status(502).json({ error: "Outscraper reviews-v3 failed", details: t });
       }
-      if (!result) {
-        return res.status(504).json({
-          error: "Outscraper job still pending",
-          note: "Bitte in ein paar hundert Millisekunden nochmal anfragen oder retry-Logik erweitern.",
-          lastStatus: firstJson.status,
-        });
+      const reviewsJson = await reviewsResp.json();
+      const reviewEntry = Array.isArray(reviewsJson.data) ? reviewsJson.data[0] : null;
+      if (reviewEntry) {
+        if (reviewEntry.reviews_per_score) {
+          for (let i = 1; i <= 5; i++) {
+            breakdown[i] = Number(reviewEntry.reviews_per_score[i] || 0);
+          }
+          totalReviews = Object.values(breakdown).reduce((sum, v) => sum + Number(v || 0), 0);
+        }
+        averageRating = parseFloat(
+          (reviewEntry.rating ??
+            (totalReviews
+              ? Object.entries(breakdown).reduce((acc, [star, cnt]) => acc + Number(star) * Number(cnt), 0) /
+                totalReviews
+              : 0)
+          ).toFixed(2)
+        );
       }
     } else {
-      result = firstJson;
-    }
-
-    // Extrahiere Daten: es kommt ein Array in result.data
-    const entry = Array.isArray(result.data) ? result.data[0] : null;
-    if (!entry) {
-      return res.status(404).json({ error: "Missing place data", raw: result });
-    }
-
-    // Breakdown: bevorzugt reviews_per_score wenn vorhanden
-    let breakdown = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-    if (entry.reviews_per_score) {
-      // Erwartet z.B. { "1": 47, "2": 31, ... }
-      for (let i = 1; i <= 5; i++) {
-        breakdown[i] = Number(entry.reviews_per_score[i] || 0);
+      // aus search-v3 some averageRating nehmen oder berechnen
+      if (!averageRating && totalReviews > 0) {
+        const sum = Object.entries(breakdown).reduce((acc, [star, cnt]) => acc + Number(star) * Number(cnt), 0);
+        averageRating = parseFloat((sum / totalReviews).toFixed(2));
       }
-    } else if (Array.isArray(entry.reviews)) {
-      // Fallback: aus einzelnen Reviews aggregieren
-      entry.reviews.forEach((r) => {
-        const rating = Math.round(Number(r.review_rating ?? r.rating ?? 0));
-        if (rating >= 1 && rating <= 5) {
-          breakdown[rating]++;
-        }
-      });
+      averageRating = parseFloat(averageRating.toFixed ? averageRating.toFixed(2) : averageRating);
     }
 
-    const totalReviews = Number(entry.review_count ?? entry.reviews ?? 0) || Object.values(breakdown).reduce((a, b) => a + b, 0);
-    let averageRating = parseFloat(entry.rating ?? entry.review_rating_average ?? 0);
-    if (!averageRating && totalReviews > 0) {
-      // berechne aus breakdown
-      const sum = Object.entries(breakdown).reduce((acc, [star, cnt]) => acc + Number(star) * Number(cnt), 0);
-      averageRating = sum / totalReviews;
-    }
-
-    // response
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     return res.status(200).json({
       placeId,
       totalReviews,
-      averageRating: parseFloat(averageRating.toFixed(2)),
+      averageRating,
       breakdown,
       source: { usedOutscraper: true },
     });
