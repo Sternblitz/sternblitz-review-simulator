@@ -1,10 +1,9 @@
 // api/reviews.js
 export default async function handler(req, res) {
-  // erlaubt einfache CORS-Tests aus dem Browser
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") {
-    // Preflight
     return res.status(204).end();
   }
 
@@ -12,41 +11,65 @@ export default async function handler(req, res) {
   const key = process.env.OUTSCRAPER_API_KEY;
   if (!key) return res.status(500).json({ error: "Missing Outscraper API key" });
 
-  if (!name && !placeId) {
+  if (!placeId && !name) {
     return res.status(400).json({ error: "Provide at least placeId or name (plus optional address)" });
   }
-
-  // Baue die Query: wenn Name vorhanden, nutze "Name, Address", sonst fallback auf placeId
- let queryStr;
-if (placeId) {
-  queryStr = `place_id:${placeId}`;
-} else {
-  queryStr = name + (address ? `, ${address}` : "");
-}
-
-  const url = new URL("https://api.app.outscraper.com/maps/search-v3");
-  url.searchParams.set("query", queryStr);
-  url.searchParams.set("language", "en");
-  url.searchParams.set("organizationsPerQueryLimit", "1");
-  url.searchParams.set("async", "false");
 
   const headers = {
     "X-Api-Key": key,
     Accept: "application/json",
   };
 
-  try {
-    const out = await fetch(url.toString(), { method: "GET", headers });
-    if (!out.ok) {
-      const txt = await out.text();
-      return res.status(502).json({ error: "Outscraper search-v3 failed", details: txt });
-    }
-    const json = await out.json();
+  let first = null;
 
-    // Suche das erste Place-Objekt
-    const first = Array.isArray(json.data) && Array.isArray(json.data[0]) ? json.data[0][0] : null;
-    if (!first) {
-      return res.status(404).json({ error: "Place not found in search-v3 response", raw: json });
+  try {
+    if (placeId) {
+      // Direkt reviews-v3 mit placeId holen (liefert reviews_per_score)
+      const url = new URL("https://api.app.outscraper.com/maps/reviews-v3");
+      url.searchParams.set("query", placeId);
+      // optional: nur Summary, keine einzelnen Reviews (wenn die API das unterstützt)
+      url.searchParams.set("reviewsLimit", "0");
+      url.searchParams.set("language", "en");
+      url.searchParams.set("async", "false");
+
+      const out = await fetch(url.toString(), { method: "GET", headers });
+      if (!out.ok) {
+        const txt = await out.text();
+        return res.status(502).json({ error: "Outscraper reviews-v3 failed", details: txt });
+      }
+      const json = await out.json();
+      // flexible First-Extraction (manche Antworten haben nested arrays)
+      if (Array.isArray(json.data)) {
+        if (Array.isArray(json.data[0])) {
+          first = json.data[0][0];
+        } else {
+          first = json.data[0];
+        }
+      }
+      if (!first) {
+        return res.status(404).json({ error: "Place not found in reviews-v3 response", raw: json });
+      }
+    } else {
+      // fallback: Name (+ optional Adresse) über search-v3
+      const queryStr = `${name}${address ? `, ${address}` : ""}`;
+      const url = new URL("https://api.app.outscraper.com/maps/search-v3");
+      url.searchParams.set("query", queryStr);
+      url.searchParams.set("language", "en");
+      url.searchParams.set("organizationsPerQueryLimit", "1");
+      url.searchParams.set("async", "false");
+
+      const out = await fetch(url.toString(), { method: "GET", headers });
+      if (!out.ok) {
+        const txt = await out.text();
+        return res.status(502).json({ error: "Outscraper search-v3 failed", details: txt });
+      }
+      const json = await out.json();
+      if (Array.isArray(json.data) && Array.isArray(json.data[0])) {
+        first = json.data[0][0];
+      }
+      if (!first) {
+        return res.status(404).json({ error: "Place not found in search-v3 response", raw: json });
+      }
     }
 
     // Breakdown vorbereiten
